@@ -1,0 +1,420 @@
+---
+title: "418 Homework 3"
+author: "Jordan Berninger - 304872549"
+date: "5/23/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(glmnet)
+library(ROCR)
+library(pROC)
+library(h2o)
+library(xgboost)
+
+
+artists <- read.csv("~/Desktop/UCLA/MAS/Stats418/artists.csv", header = TRUE)
+
+
+artworks <- read.csv("~/Desktop/UCLA/MAS/Stats418/artworks.csv", header = TRUE)
+
+
+artworks$Date <- as.Date(artworks$Date, "%Y")
+
+artworks$Acquisition.Date <- as.Date(artworks$Acquisition.Date)
+
+artworks <- mutate(artworks, Acquisition.Diff = as.Date(artworks$Acquisition.Date) - as.Date(artworks$Date, "%Y"))
+
+
+artists <- mutate(artists, Death.Status = as.factor(ifelse(is.na(artists$Death.Year), "0", "1")))
+
+art.art <- merge(artworks, artists, by = "Artist.ID")
+
+art.art <- subset(art.art, select = c(Gender, Date, Credit, Catalogue, 
+                                      Acquisition.Date,
+                                      Department, Nationality, Birth.Year,
+                                       Death.Status))
+
+
+art.art <- subset(art.art, !art.art$Gender=="")
+art.art <- subset(art.art, !art.art$Gender=="male")
+
+art.art$Gender <- as.factor(ifelse(art.art$Gender=="Female", 0, 1))
+
+set.seed(6666)
+
+art.art <- na.omit(art.art)
+
+N <- nrow(art.art)
+idx <- sample(1:N, 0.6*N)
+d_train <- art.art[idx,]
+d_test <- art.art[-idx,]
+
+X <- Matrix::sparse.model.matrix(Gender ~ . - 1, data = art.art)
+X_train <- X[idx,]
+X_test <- X[-idx,]
+```
+
+$\textbf{Introduction to MoMA Collection dataset}$
+
+I chose to analyze the Museum of Modern Art Collection dataset from Kaggle (https://www.kaggle.com/momanyc/museum-collection). There were two files in this dataset, artists and artworks. I joined the datasets on a shared variable (Artist.ID) and decided to model artist gender from the following variables. 
+
+```{r}
+colnames(art.art)
+```
+
+To clean the data, I had to manipulate the Gender variable into a factor. I noticed that there were many artworks that had a blank for the artist gender. I assumed that these were pieces produced by groups, or non-binary gender artists. For the sake of simplicity and assignment constraints, I removed null gender values, so each artwork in the dataset was associated with either a Male or Femla artist. It was also necessary to do some transformation on the several Date, Acquisition.Date, Birth.Year, and Death.Year columns. They had different structures in the raw data so I converted them accordingly. I chose to create Death.Status as a boolean variable. After removing incolplete rows, I was left with the following cleaned dataset.
+
+```{r}
+str(art.art)
+
+summary(art.art)
+```
+
+Before running any models, I produced a lot of plots and summary statistics to familiarize myself with the data. I thought this plot was interesting:
+
+```{r}
+ggplot(art.art, aes(x=Department, y=Date, color=Gender)) + geom_boxplot()
+```
+
+Here, we see the 9 Departments in the dataset on the x-axis, and the year that the artwork was produced on the y-axis. Males are blue (1), female are orange (0). We can see that for the "Fluxus Collection" and "Media and Performance Art" (in the middle) the temporal distribution are similar for the two genders. On the other hand, the "Prints & Illustrated Books" collection shows that the earlier a piece was produced, the more likely that it was made by a male. 
+
+The data was randomly divided into training and test sets, with the training set representing 60% of the data. We will compare the performance of each model on the two data sets, where possible.
+
+$\textbf{Logistic Regression with Lasso Regularization}$
+
+$\textbf{glmnet}$
+
+```{r, echo=FALSE}
+library(glmnet)
+
+system.time({
+  md <- glmnet( X_train, d_train$Gender, family = "binomial", lambda = 0)
+})
+## slow
+phat <- predict(md, newx = X_test, type = "response")
+rocr_pred <- prediction(phat, d_test$Gender)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+```
+
+
+First, I used the glmnet package. I trained the model on the training set, and I gave it a lambda value of .5. This model took quite a bit of time for this model to train. The AUC performance on the test data was .5.
+
+Next, used the cv.glmnet() model in the same package to perform a cross-validated fit on the training set. The default setting for this model is a 10-fold cross validation, and if you don't pass it an initial lambda value, it will produce give you the optimized lambda value. Because this model uses cross-validation, its prediction performance is more robust than that of a non-cross validated process. In this case the optimal lambda generated is 0.005254245, and the AUC performance on the test data was 0.855224 which is much better than that of the previous model.
+
+```{r}
+system.time({
+  md1 <- cv.glmnet( X_train, d_train$Gender, family = "binomial")
+})
+## very slow
+
+phat1 <- predict(md1, newx = X_test, type = "response")
+rocr_pred1 <- prediction(phat1, d_test$Gender)
+performance(rocr_pred1, "auc")@y.values[[1]]
+```
+
+$\textbf{h2o}$
+
+```{r, echo=FALSE, include = FALSE}
+library(h2o)
+
+
+h2o.init(nthreads=-1)
+
+write.csv(art.art, "moma.csv")
+
+dx <- h2o.importFile("Desktop/moma.csv")
+
+dx_split <- h2o.splitFrame(dx, ratios = 0.6, seed = 666)
+dx_train <- dx_split[[1]]
+dx_test <- dx_split[[2]]
+
+
+Xnames <- names(dx_train)[which(names(dx_train)!="Gender")]
+```
+
+Next, I ran the h2o implementation of logistic regression through a h2o.glm() model setting the family to binomial. h2o requires that the data be in a special format, so I used the h2o.importFile() and the h2o.splitFrame() functions to import and sample the data, respectively. This is noteworthy, because the h2o training and test datasets are the same size as the glmnet ones, but the sets are themselves different.
+
+The h2o.glm() object has 2 parameters, alpha and lambda, that I tweaked several times for different models. These models all trained themselves in a fraction of the time of glmnet models, which was really cool. My cv.glmnet() model took a significant amount of time to train. The difference in speed is enough to make me favor h2o over glmnet, because the tool is much more agile and one can tweak the prameters and re-run with rapidity.
+
+First, we will look at the results for the h2o.glm() model with $\alpha = 1$, $\lambda = 0$
+
+```{r}
+
+system.time({
+  md_1.0 <- h2o.glm(x = Xnames, y = "Gender", training_frame = dx_train, 
+                family = "binomial", alpha = 1, lambda = 0)
+})
+
+md_1.0
+
+h2o.auc(h2o.performance(md_1.0, dx_test))
+# Plot ROC curve
+h2o.performance(md_1.0, dx_test)
+plot(h2o.performance(md_1.0, dx_test), type = "roc")         
+```
+
+This model had a training AUC of 0.8973 and a test AUC of 0.8863, meaning it slightly outperformed the glmnet() implementation.
+
+Now will look at the results for the h2o.glm() model with $\alpha = 0$, $\lambda = 1$
+
+```{r}
+system.time({
+md_0.1 <- h2o.glm(x = Xnames, y = "Gender", training_frame = dx_train, 
+                  family = "binomial", alpha = 0, lambda = 1)
+})
+
+md_0.1
+h2o.auc(h2o.performance(md_0.1, dx_test))
+# Plot ROC curve
+h2o.performance(md_0.1, dx_test)
+plot(h2o.performance(md_0.1, dx_test), type = "roc")         
+
+```
+
+This model did not perform as well on the training set, with an AUC of 0.7462, and on the test set, and similarily it did not perform as well on the test set, with and AUC of 0.7498. Furthermore, we can see a bump in the middleof the ROC curve, which indicates and inefficent region.
+
+Now, results for the h2o.glm() model with $\alpha = 1$, $\lambda = 1$.
+
+```{r}
+system.time({
+md_1.1 <- h2o.glm(x = Xnames, y = "Gender", training_frame = dx_train, 
+                  family = "binomial", alpha = 1, lambda = 1)
+})
+## train time elapsed 2.607
+md_1.1
+# train AUC:  0.5
+h2o.auc(h2o.performance(md_1.1, dx_test))
+# test AUC .5 SAME AS GLMNET performances
+# Plot ROC curve
+h2o.performance(md_1.1, dx_test)
+plot(h2o.performance(md_1.1, dx_test), type = "roc")
+```
+
+Clearly, there is something wrong with this model, as it has both training and test AUC = .5 and a flat ROC line. I will look deeper into the nature of the case where both $\lambda = \alpha = 1$.
+
+Out of all the logistic regression models, the one that performed the best on the training and test data was the h2o implementation of the GLM $\alpha = 1$, $\lambda = 0$. The cv.glmnet() model performed similarily on the test data, but it it significant that the code took much longer to run.
+
+$\textbf{Random Forests}$
+
+$\textbf{h2o}$
+
+First, I ran severl random forests through th h2o implementation. This was very easy to do, as it has most of the same syntax as the h2o.glm() function and I can feed it the same data. I manipulated the ntrees and the max_depth parameters for several models, whichare summarized below:
+
+100 trees and max_depth = 5
+
+```{r}
+system.time({
+  rf_100.5 <- h2o.randomForest(x = Xnames, y = "Gender", training_frame = dx_train, ntrees = 100, max_depth=5)
+})
+rf_100.5
+h2o.auc(h2o.performance(rf_100.5, dx_test))
+h2o.mse(h2o.performance(rf_100.5, dx_test))
+
+
+```
+
+For some reason, my model is not returning AUC as a performance metric for random forests. This is peculiar, as classmates have not had this issue. We note that this model had a training metric of MSE:  0.0833 and a test  MSE: 0.0842, which seems quite modest.
+
+Now, we will reduce the max_depth to 3 of the trees and see how it impacts performanca.
+
+```{r}
+system.time({
+  rf_100.3 <- h2o.randomForest(x = Xnames, y = "Gender", training_frame = dx_train, ntrees = 100, max_depth=3)
+})
+rf_100.3
+h2o.auc(h2o.performance(rf_100.3, dx_test))
+h2o.mse(h2o.performance(rf_100.3, dx_test))
+```
+
+It seems counterintuitive, but reducing the max_depth of the trees increased training MSE to 0.0943 and the test MSE was also higher than the previous model.
+
+Now, 200 trees and max_depth = 5.
+
+```{r}
+system.time({
+  rf_200.5 <- h2o.randomForest(x = Xnames, y = "Gender", training_frame = dx_train, ntrees = 200, max_depth=5)
+})
+rf_200.5
+h2o.auc(h2o.performance(rf_200.5, dx_test))
+h2o.mse(h2o.performance(rf_200.5, dx_test))
+```
+
+Now, 200 trees and max_depth = 3
+ 
+```{r}
+system.time({
+  rf_200.3 <- h2o.randomForest(x = Xnames, y = "Gender", training_frame = dx_train, ntrees = 200, max_depth=3)
+})
+rf_200.3
+h2o.auc(h2o.performance(rf_200.3, dx_test))
+h2o.mse(h2o.performance(rf_200.3, dx_test))
+```
+
+This last model with 200 trees and max_depth = 3 performed the best on both the training and test data with MSE = 0.09464 and 0.09552, respectively. I am not sure why my h2o version is not reporting AUC as a performance metric, but I will figure that out.
+
+$\textbf{xgboost}$
+
+Next, I ran the xgboost implementation of a random forest model. I fed the model the same combinations of parameters, but it is worth noting that there were several parameters that I passed to these models as constants, specifically, I specified, but did not change, the subsample parameter. 
+
+100 trees and max depth = 5
+
+```{r}
+system.time({
+  n_proc <- parallel::detectCores()
+  xgb_100.5 <- xgboost(data = X_train, label = d_train$Gender,
+                nthread = n_proc, nround = 1, max_depth = 5,
+                num_parallel_tree = 100, subsample = 0.632,
+                colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                save_period = NULL)
+})
+
+phat.xgb_100.5 <- predict(xgb_100.5, newdata = X_test)
+## Plot the ROC curve
+plot.roc(d_test$Gender, phat.xgb_100.5, print.auc=T, print.auc.y=0.5) 
+
+rocr_pred.xgb_100.5 <- prediction(phat.xgb_100.5, d_test$Gender)
+performance(rocr_pred.xgb_100.5, "auc")@y.values[[1]]
+```
+
+100 trees and max depth = 3
+
+```{r}
+system.time({
+  n_proc <- parallel::detectCores()
+  xgb_100.3 <- xgboost(data = X_train, label = d_train$Gender,
+                nthread = n_proc, nround = 1, max_depth = 3,
+                num_parallel_tree = 100, subsample = 0.632,
+                colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                save_period = NULL)
+})
+
+phat.xgb_100.3 <- predict(xgb_100.5, newdata = X_test)
+## Plot the ROC curve
+plot.roc(d_test$Gender, phat.xgb_100.5, print.auc=T, print.auc.y=0.5) 
+
+rocr_pred.xgb_100.3 <- prediction(phat.xgb_100.3, d_test$Gender)
+performance(rocr_pred.xgb_100.3, "auc")@y.values[[1]]
+```
+
+200 trees and max depth = 5
+
+```{r}
+system.time({
+  n_proc <- parallel::detectCores()
+  xgb_200.5 <- xgboost(data = X_train, label = d_train$Gender,
+                nthread = n_proc, nround = 1, max_depth = 5,
+                num_parallel_tree = 200, subsample = 0.632,
+                colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                save_period = NULL)
+})
+
+phat.xgb_200.5 <- predict(xgb_200.5, newdata = X_test)
+## Plot the ROC curve
+plot.roc(d_test$Gender, phat.xgb_200.5, print.auc=T, print.auc.y=0.5) 
+
+rocr_pred.xgb_200.5 <- prediction(phat.xgb_200.5, d_test$Gender)
+performance(rocr_pred.xgb_200.5, "auc")@y.values[[1]]
+```
+
+
+200 trees and max depth = 3
+
+```{r}
+system.time({
+  n_proc <- parallel::detectCores()
+  xgb_200.3 <- xgboost(data = X_train, label = d_train$Gender,
+                nthread = n_proc, nround = 1, max_depth = 3,
+                num_parallel_tree = 200, subsample = 0.632,
+                colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                save_period = NULL)
+})
+# trian time elapsed 22.993
+phat.xgb_200.3 <- predict(xgb_200.3, newdata = X_test)
+## Plot the ROC curve
+plot.roc(d_test$Gender, phat.xgb_200.3, print.auc=T, print.auc.y=0.5) 
+
+rocr_pred.xgb_200.3 <- prediction(phat.xgb_200.3, d_test$Gender)
+performance(rocr_pred.xgb_200.3, "auc")@y.values[[1]]
+```
+
+We can see that all of the xgboost models performed similarily on the test data. I am not sure how to get the performance metrics for these models on the training data, however, which is frustrating. I also cannot pull the MSE from these models, so I have no comparison metric between xgboost an h2o.glm models. I will continue to plug away on this.
+
+Overall, I think that the h2o implementation is really great in terms of ease of use. You can easily run different models on the same objects and compare performance. xgboost is nice, and it seems to perform well, but it requires a bit more code, or parameters in particular. Furthermore, it is harder to compare an xgboost model to other machine learning models, as you may have to wrangle the data differently and you may not be able to regularize the many parameters.
+
+$\textbf{Gradient Boosting Machine}$
+
+$\textbf{h2o}$
+
+I ran several gradient boosting machine models through thr h2o package. The models trained quickly, which is good, but my GBM models did not return AUC as a performance metric on neither the training nor test sets. I am not sure why this is, but it is not good, because AUC is an important performance metric for comparing models. I also had some difficulty generating the ROC curves for these models, which isn't good either. When I consider the MSE of these models on the test sets, I am disappointed with the results, as they do perform as well as the h2o.randomForest() in terms of MSE.
+
+```{r}
+system.time({
+  gbm1 <- h2o.gbm(x = Xnames, y = "Gender", training_frame = dx_train, 
+                    ntrees = 100, max_depth = 3, min_rows = 2)
+})
+gbm1
+
+h2o.mse(h2o.performance(gbm1, dx_test))
+h2o.auc(h2o.performance(gbm1, dx_test))
+
+
+h2o.performance(gbm1, dx_test)
+```
+
+I also run into issues with this GBM  implementation when I try and use more than 200 trees in the forest on my local system. When  I try and go beyond 100 trees, I see the error message "Details: ERRR on field: _ntrees: The tree model will not fit in the driver node's memory (315.5 KB per tree x 200 > 56.4 MB)". This is very disappointing. I also hit this error when I try and increase the max_depth or the min_rows with ntrees = 100.
+
+
+```{r}
+system.time({
+  gbm2 <- h2o.gbm(x = Xnames, y = "Gender", training_frame = dx_train, 
+                    ntrees = 100, max_depth = 5, min_rows = 3)
+})
+gbm2
+
+h2o.mse(h2o.performance(gbm2, dx_test))
+
+h2o.performance(gbm2, dx_test)
+```
+
+In this next model, we will increase the learn_rate parameter from its default value of 0.1 to 0.5.
+
+```{r}
+system.time({
+  gbm3 <- h2o.gbm(x = Xnames, y = "Gender", training_frame = dx_train, 
+                    ntrees = 100, max_depth = 5, min_rows = 3, learn_rate = .5)
+})
+gbm3
+
+h2o.mse(h2o.performance(gbm3, dx_test))
+
+h2o.performance(gbm3, dx_test)
+```
+
+Now, we will reduce the learn_rate parameter to 0.05
+
+```{r}
+system.time({
+  gbm4 <- h2o.gbm(x = Xnames, y = "Gender", training_frame = dx_train, 
+                    ntrees = 100, max_depth = 5, min_rows = 3, learn_rate = .05)
+})
+gbm4
+
+h2o.mse(h2o.performance(gbm4, dx_test))
+
+h2o.performance(gbm4, dx_test)
+```
+
+I tried manipulating the stopping parameter, but my machine seems to lack sufficient resources. I will try and run thid code on a more powerful system at school, but I am not sure if I will be able to complete this by noon.
+
+
+$\textbf{Conclusions}$
+
+It was nice to get some code up and running, and to process test datasets through trained models. I think it was a productive exercise, but I definitely ran into some issuse with finding common comparison metrics. I think I have lots to learn, but I think this was a solid step. I plan on working through the issues I experienced on this assignment with my classmates and on my own time.
+
+
